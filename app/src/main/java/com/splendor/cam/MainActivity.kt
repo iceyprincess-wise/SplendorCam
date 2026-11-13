@@ -5,7 +5,11 @@ import android.app.Activity
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
+import android.graphics.Matrix
+import android.hardware.camera2.CaptureResult
+import android.net.Uri
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
@@ -97,6 +101,15 @@ class MainActivity : Activity() {
     private val pendingResults = ArrayDeque<TotalCaptureResult>()
     private val lock = Any()
 
+    // ---------- processing state (round 1) ----------
+    private lateinit var processButton: Button
+    private val lookButtons = ArrayList<Button>()
+    private var selectedLook: Look = Looks.NATURAL
+    private val lastBurstUris = ArrayList<Uri>()
+    private var lastBurstFacing = CameraCharacteristics.LENS_FACING_BACK
+    private var lastBurstIso = 400
+    private var processing = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -138,6 +151,27 @@ class MainActivity : Activity() {
             addView(switchButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(modeButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
+        // Round 1: look selector + process button, enabled after a burst.
+        val lookRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        for (look in Looks.ALL) {
+            val b = Button(this).apply {
+                text = look.id.replaceFirstChar { it.uppercase() }
+                isEnabled = false
+                setOnClickListener {
+                    selectedLook = look
+                    updateLookButtons()
+                }
+            }
+            lookButtons.add(b)
+            lookRow.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        processButton = Button(this).apply {
+            text = "Process burst"
+            isEnabled = false
+            setOnClickListener { processBurst() }
+        }
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(textureView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -147,6 +181,8 @@ class MainActivity : Activity() {
             addView(isoSeek)
             addView(expLabel)
             addView(expSeek)
+            addView(lookRow)
+            addView(processButton)
         }
         setContentView(layout)
 
@@ -395,6 +431,8 @@ class MainActivity : Activity() {
         burstFinished = 0
         burstId++
         val thisBurst = burstId
+        lastBurstUris.clear()
+        lastBurstFacing = facing
         synchronized(lock) {
             pendingImages.clear()
             pendingResults.clear()
@@ -494,6 +532,7 @@ class MainActivity : Activity() {
         runOnUiThread {
             shutterButton.isEnabled = true
             setStatus("Saved $burstSaved of $BURST_FRAMES DNGs — ${BURST_FRAMES - burstSaved} frame(s) had no result.")
+            if (burstSaved > 0) enableProcessing()
         }
     }
 
@@ -518,6 +557,8 @@ class MainActivity : Activity() {
                 DngCreator(chars, result).use { dng -> dng.writeImage(out, image) }
             }
             ok = true
+            lastBurstUris.add(uri)
+            lastBurstIso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: lastBurstIso
         } catch (e: Exception) {
             Log.e(TAG, "DNG save failed", e)
         } finally {
@@ -541,11 +582,135 @@ class MainActivity : Activity() {
                             Toast.LENGTH_LONG
                         ).show()
                     }
+                    if (saved > 0) enableProcessing()
                 } else {
                     setStatus("Saving DNG $done of $BURST_FRAMES…")
                 }
             }
         }
+    }
+
+    // ---------- processing (round 1) ----------
+
+    private fun updateLookButtons() {
+        for ((i, b) in lookButtons.withIndex()) {
+            val look = Looks.ALL[i]
+            b.text = (if (look == selectedLook) "✓ " else "") + look.id.replaceFirstChar { it.uppercase() }
+        }
+        processButton.text = "Process burst (${selectedLook.displayName})"
+    }
+
+    /** Enables the look selector + process button after a burst saved >= 1 DNG.
+     * Default look: night when the burst ISO is high (>= 800, indoor/low light),
+     * natural otherwise. */
+    private fun enableProcessing() {
+        selectedLook = Looks.defaultFor(lastBurstIso >= 800)
+        for (b in lookButtons) b.isEnabled = true
+        updateLookButtons()
+        processButton.isEnabled = true
+    }
+
+    private fun processBurst() {
+        if (processing) return
+        val uris = ArrayList(lastBurstUris)
+        if (uris.isEmpty()) {
+            setStatus("No burst DNGs to process — capture a burst first.")
+            return
+        }
+        val look = selectedLook
+        val isFront = lastBurstFacing == CameraCharacteristics.LENS_FACING_FRONT
+        processing = true
+        processButton.isEnabled = false
+        setStatus("Processing ${uris.size} frames (${look.displayName})…")
+        Thread {
+            try {
+                val outName = processBurstBlocking(uris, look, isFront)
+                runOnUiThread {
+                    processing = false
+                    processButton.isEnabled = true
+                    setStatus("Saved $outName to Pictures/SplendorCam")
+                    Toast.makeText(this, "Saved $outName", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Processing failed", e)
+                runOnUiThread {
+                    processing = false
+                    processButton.isEnabled = true
+                    setStatus("Processing failed: ${e.message}")
+                }
+            }
+        }.start()
+    }
+
+    /** Reads the burst DNGs one at a time, merges, processes, orients and
+     * saves a JPEG next to the DNGs. Runs off the UI thread. Frames are
+     * streamed into one merged RAW, so a 5-frame burst never sits in
+     * memory as 5 full RAWs (25MB each). */
+    private fun processBurstBlocking(uris: List<Uri>, look: Look, isFront: Boolean): String {
+        var info: DngInfo? = null
+        var merged: FloatArray? = null
+        var n = 0
+        for (uri in uris) {
+            val pair = contentResolver.openInputStream(uri)?.use { DngReader.read(it) }
+                ?: throw IllegalStateException("cannot open $uri")
+            val (i, raw) = pair
+            if (info == null) {
+                info = i
+                merged = FloatArray(i.width * i.height)
+            }
+            if (i.width != info.width || i.height != info.height ||
+                !i.cfaPattern.contentEquals(info.cfaPattern)
+            ) {
+                Log.w(TAG, "Skipping frame with mismatched size/CFA: $uri")
+                continue
+            }
+            RawProcessor.accumulate(merged!!, raw, info)
+            n++
+        }
+        if (info == null || merged == null || n == 0) {
+            throw IllegalStateException("no usable DNG frames")
+        }
+        RawProcessor.scaleAcc(merged, 1f / n)
+        val dng = info
+        val sensor = Bitmap.createBitmap(dng.width, dng.height, Bitmap.Config.ARGB_8888)
+        val stats = RawProcessor.process(merged, dng, look, RawProcessor.TileSink { x, y, w, h, argb ->
+            sensor.setPixels(argb, 0, w, x, y, w, h)
+        })
+        Log.i(TAG, "Processed ${dng.width}x${dng.height} look=${look.id} frames=$n " +
+            "baseGain=${stats.baseGain} totalGain=${stats.totalGain}")
+        // Orientation: the sensor frame is landscape, the phone was held
+        // portrait. FRONT = 90 deg CCW + horizontal mirror; BACK = 90 deg CW.
+        // (Verified against the stock JPEGs in the sandbox; same mapping as
+        // np.rot90 + fliplr in the reference processor.)
+        val matrix = Matrix()
+        if (isFront) {
+            matrix.postRotate(-90f)
+            matrix.postScale(-1f, 1f)
+        } else {
+            matrix.postRotate(90f)
+        }
+        val oriented = Bitmap.createBitmap(sensor, 0, 0, dng.width, dng.height, matrix, true)
+        sensor.recycle()
+        val stem = contentResolver.query(
+            uris[0], arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null
+        )?.use { c ->
+            if (c.moveToFirst()) c.getString(0)?.removeSuffix(".dng") else null
+        } ?: "splendorcam_processed"
+        val name = "${stem}_${look.id}.jpg"
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/SplendorCam")
+        }
+        val outUri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("MediaStore insert failed for JPEG")
+        contentResolver.openOutputStream(outUri)?.use { out ->
+            if (!oriented.compress(Bitmap.CompressFormat.JPEG, 92, out)) {
+                throw IllegalStateException("JPEG compress failed")
+            }
+        } ?: throw IllegalStateException("cannot open output stream for JPEG")
+        oriented.recycle()
+        return name
     }
 
     // ---------- controls ----------
