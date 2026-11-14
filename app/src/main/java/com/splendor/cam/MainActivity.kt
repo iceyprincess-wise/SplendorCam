@@ -6,8 +6,10 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.Typeface
 import android.hardware.camera2.CaptureResult
 import android.net.Uri
 import android.graphics.SurfaceTexture
@@ -30,9 +32,15 @@ import android.provider.MediaStore
 import android.util.Log
 import android.util.Range
 import android.util.Size
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.Surface
 import android.view.TextureView
+import android.view.ViewGroup
 import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
+import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
@@ -44,7 +52,7 @@ import java.util.Locale
 import kotlin.math.pow
 
 /**
- * SplendorCam v1 — RAW burst capture scaffold.
+ * SplendorCam — RAW burst capture + in-app processing.
  *
  * Proven design (Camera Probe on the Redmi 15C, 2026-11-12): both cameras are
  * LEVEL_3 with RAW + manual sensor + burst. Back RAW is 4080x3072, front
@@ -52,9 +60,15 @@ import kotlin.math.pow
  * each Image is written to a DNG and closed as soon as it arrives, never
  * held as a whole burst in memory. Max exposure is 0.4s/frame.
  *
- * v1 scope: live preview, back/front switch, 5-frame RAW burst saved as DNG
- * files in Pictures/SplendorCam, manual ISO + exposure sliders, auto mode.
- * No processing pipeline yet — that is the next round, built on this.
+ * Round 1 (2026-11-13): pure-Kotlin RAW processor (RawProcessor.kt) with
+ * the 7 looks (Looks.kt) — merge, demosaic, tone map, save JPEG next to
+ * the DNGs. Round 2 (this file): proper camera UI — full-screen preview,
+ * big round shutter, look strip, labelled ISO/exposure sliders — and the
+ * colour fix (ForwardMatrix1 -> XYZ D50 -> Bradford -> sRGB).
+ *
+ * Behaviour kept from v1/round 1: 5-frame RAW burst to DNG in
+ * Pictures/SplendorCam, manual ISO + exposure sliders, front/back switch,
+ * 7 looks + Process button, default look night at ISO >= 800.
  */
 class MainActivity : Activity() {
 
@@ -66,12 +80,15 @@ class MainActivity : Activity() {
 
     private lateinit var textureView: TextureView
     private lateinit var statusView: TextView
+    private lateinit var facingView: TextView
+    private lateinit var rangeHint: TextView
     private lateinit var isoLabel: TextView
     private lateinit var expLabel: TextView
     private lateinit var isoSeek: SeekBar
     private lateinit var expSeek: SeekBar
-    private lateinit var shutterButton: Button
+    private lateinit var shutterButton: ImageButton
     private lateinit var modeButton: Button
+    private lateinit var switchButton: ImageButton
 
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
@@ -103,37 +120,77 @@ class MainActivity : Activity() {
 
     // ---------- processing state (round 1) ----------
     private lateinit var processButton: Button
-    private val lookButtons = ArrayList<Button>()
+    private val lookButtons = ArrayList<TextView>()
     private var selectedLook: Look = Looks.NATURAL
     private val lastBurstUris = ArrayList<Uri>()
     private var lastBurstFacing = CameraCharacteristics.LENS_FACING_BACK
     private var lastBurstIso = 400
     private var processing = false
 
+    private fun dp(v: Int): Int =
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // ---------- full-screen preview ----------
         textureView = TextureView(this)
         textureView.surfaceTextureListener = textureListener
+        val root = FrameLayout(this)
+        root.addView(
+            textureView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
 
+        // ---------- top overlay: title + facing + status ----------
         statusView = TextView(this).apply {
-            textSize = 14f
-            setPadding(16, 16, 16, 16)
+            textSize = 12f
+            setTextColor(Color.LTGRAY)
         }
-        shutterButton = Button(this).apply {
-            text = "Capture RAW burst (5)"
-            setOnClickListener { captureBurst() }
+        facingView = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.LTGRAY)
+            gravity = Gravity.END
         }
-        val switchButton = Button(this).apply {
-            text = "Switch camera"
-            setOnClickListener { switchCamera() }
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = "SPLENDORCAM"
+                    textSize = 16f
+                    setTextColor(Color.WHITE)
+                    typeface = Typeface.DEFAULT_BOLD
+                },
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            addView(
+                facingView,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            )
         }
-        modeButton = Button(this).apply {
-            text = "Mode: Auto"
-            setOnClickListener { toggleMode() }
+        val topPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundResource(R.drawable.panel_bg)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            addView(titleRow)
+            addView(statusView)
         }
-        isoLabel = TextView(this).apply { textSize = 14f }
-        expLabel = TextView(this).apply { textSize = 14f }
+        root.addView(
+            topPanel,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP
+            )
+        )
+
+        // ---------- bottom control panel ----------
         isoSeek = SeekBar(this).apply {
             max = 100
             isEnabled = false
@@ -144,52 +201,148 @@ class MainActivity : Activity() {
             isEnabled = false
             setOnSeekBarChangeListener(seekListener(isIso = false))
         }
-
-        val buttonRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(shutterButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addView(switchButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addView(modeButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        isoLabel = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.END
         }
-        // Round 1: look selector + process button, enabled after a burst.
+        expLabel = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.END
+        }
+        rangeHint = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.LTGRAY)
+        }
+
+        // Look strip: horizontally scrollable chips (round 1 used a cramped
+        // 7-button row that did not fit the screen).
         val lookRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
         }
         for (look in Looks.ALL) {
-            val b = Button(this).apply {
+            val chip = TextView(this).apply {
                 text = look.id.replaceFirstChar { it.uppercase() }
+                textSize = 13f
+                setTextColor(Color.WHITE)
+                setPadding(dp(12), dp(6), dp(12), dp(6))
+                background = getDrawable(R.drawable.look_chip)
+                alpha = 0.4f // dimmed until a burst enables the selector
                 isEnabled = false
                 setOnClickListener {
                     selectedLook = look
                     updateLookButtons()
                 }
             }
-            lookButtons.add(b)
-            lookRow.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            lookButtons.add(chip)
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            lp.rightMargin = dp(6)
+            lookRow.addView(chip, lp)
         }
+        val lookScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(lookRow)
+        }
+
+        val isoRow = sliderRow("ISO", isoSeek, isoLabel)
+        val expRow = sliderRow("EXP", expSeek, expLabel)
+
+        modeButton = Button(this).apply {
+            text = "AUTO"
+            setOnClickListener { toggleMode() }
+        }
+        shutterButton = ImageButton(this).apply {
+            setBackgroundResource(R.drawable.shutter_button)
+            contentDescription = "Capture RAW burst"
+            setOnClickListener { captureBurst() }
+        }
+        switchButton = ImageButton(this).apply {
+            setBackgroundResource(R.drawable.round_button_bg)
+            setImageResource(R.drawable.ic_switch_camera)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            contentDescription = "Switch camera"
+            setOnClickListener { switchCamera() }
+        }
+        val shutterCell = FrameLayout(this).apply {
+            addView(
+                shutterButton,
+                FrameLayout.LayoutParams(dp(72), dp(72), Gravity.CENTER)
+            )
+        }
+        val controlsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(4))
+            addView(modeButton)
+            addView(
+                shutterCell,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            addView(
+                switchButton,
+                LinearLayout.LayoutParams(dp(48), dp(48))
+            )
+        }
+
         processButton = Button(this).apply {
             text = "Process burst"
             isEnabled = false
             setOnClickListener { processBurst() }
         }
-        val layout = LinearLayout(this).apply {
+
+        val bottomPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(textureView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
-            addView(statusView)
-            addView(buttonRow)
-            addView(isoLabel)
-            addView(isoSeek)
-            addView(expLabel)
-            addView(expSeek)
-            addView(lookRow)
+            setBackgroundResource(R.drawable.panel_bg)
+            setPadding(dp(12), dp(8), dp(12), dp(12))
+            addView(lookScroll)
+            addView(isoRow)
+            addView(expRow)
+            addView(rangeHint)
+            addView(controlsRow)
             addView(processButton)
         }
-        setContentView(layout)
+        root.addView(
+            bottomPanel,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM
+            )
+        )
+        setContentView(root)
 
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             setupCamera()
         } else {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA)
+        }
+    }
+
+    /** One labelled slider row: [caption] [SeekBar ........] [live value]. */
+    private fun sliderRow(caption: String, seek: SeekBar, valueView: TextView): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = caption
+                    textSize = 13f
+                    setTextColor(Color.WHITE)
+                },
+                LinearLayout.LayoutParams(dp(40), ViewGroup.LayoutParams.WRAP_CONTENT)
+            )
+            addView(
+                seek,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            addView(
+                valueView,
+                LinearLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.WRAP_CONTENT)
+            )
         }
     }
 
@@ -247,6 +400,7 @@ class MainActivity : Activity() {
         expRange?.let { expValueNs = expValueNs.coerceIn(it.lower, it.upper) }
         updateLabels()
         syncSeekPositions()
+        facingView.text = if (facing == CameraCharacteristics.LENS_FACING_BACK) "BACK" else "FRONT"
         setStatus(
             "Camera ${if (facing == CameraCharacteristics.LENS_FACING_BACK) "back" else "front"} ready — " +
                 "RAW ${rawSize ?: "unavailable"}, ISO ${isoRange ?: "?"}, " +
@@ -590,12 +744,16 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- processing (round 1) ----------
+    // ---------- processing (round 1, colour fixed in round 2) ----------
 
     private fun updateLookButtons() {
         for ((i, b) in lookButtons.withIndex()) {
             val look = Looks.ALL[i]
-            b.text = (if (look == selectedLook) "✓ " else "") + look.id.replaceFirstChar { it.uppercase() }
+            val selected = look == selectedLook
+            b.background = getDrawable(
+                if (selected) R.drawable.look_chip_selected else R.drawable.look_chip
+            )
+            b.setTextColor(if (selected) Color.BLACK else Color.WHITE)
         }
         processButton.text = "Process burst (${selectedLook.displayName})"
     }
@@ -605,7 +763,10 @@ class MainActivity : Activity() {
      * natural otherwise. */
     private fun enableProcessing() {
         selectedLook = Looks.defaultFor(lastBurstIso >= 800)
-        for (b in lookButtons) b.isEnabled = true
+        for (b in lookButtons) {
+            b.isEnabled = true
+            b.alpha = 1f
+        }
         updateLookButtons()
         processButton.isEnabled = true
     }
@@ -717,7 +878,7 @@ class MainActivity : Activity() {
 
     private fun toggleMode() {
         manualMode = !manualMode
-        modeButton.text = if (manualMode) "Mode: Manual" else "Mode: Auto"
+        modeButton.text = if (manualMode) "MAN" else "AUTO"
         isoSeek.isEnabled = manualMode
         expSeek.isEnabled = manualMode
         updateLabels()
@@ -758,9 +919,11 @@ class MainActivity : Activity() {
     }
 
     private fun updateLabels() {
-        isoLabel.text = "ISO $isoValue" + (isoRange?.let { "  (range ${it.lower}–${it.upper})" } ?: "")
-        expLabel.text = "Exposure ${formatExposure(expValueNs)}" +
-            (expRange?.let { "  (range ${formatExposure(it.lower)}–${formatExposure(it.upper)})" } ?: "")
+        isoLabel.text = "$isoValue"
+        expLabel.text = formatExposure(expValueNs)
+        rangeHint.text = "ISO " + (isoRange?.let { "${it.lower}–${it.upper}" } ?: "?") +
+            "  ·  Exp " + (expRange?.let { "${formatExposure(it.lower)}–${formatExposure(it.upper)}" } ?: "?") +
+            if (manualMode) "  ·  Manual" else "  ·  Auto"
     }
 
     private fun formatExposure(ns: Long): String {

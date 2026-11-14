@@ -25,13 +25,20 @@ import kotlin.math.pow
  *      (fraction = look.denoise), before white balance.
  *   5. White balance: gains = 1 / AsShotNeutral (green = 1), then the
  *      look's temp (R up, B down) and tint (G).
- *   6. Colour: ForwardMatrix1 (tag 50964) straight to linear sRGB.
- *      ColorMatrix1 (tag 50721) is PROVEN WRONG on its own for these
- *      files — it maps a white-balanced neutral to sRGB
- *      (0.068, 1.236, 0.588), a strong green cast, confirmed by a
- *      rendered test image. It needs the full DNG chromatic-adaptation
- *      step; ForwardMatrix1 already contains it (neutral ->
- *      (0.964, 1.000, 0.825)). Negatives are clipped to 0 after the matrix.
+ *   6. Colour: camera RGB -> linear sRGB in TWO steps (round-2 fix, proven
+ *      2026-11-14). ForwardMatrix1 (tag 50964) maps white-balanced camera
+ *      RGB to XYZ D50 -- NOT to sRGB. Round 1 treated the FM output as
+ *      linear sRGB directly, which renders the D50 white point
+ *      (0.964, 1.000, 0.825) as a yellow-green tint: measured green cast
+ *      +7 to +11 on all 4 baseline pairs, matching the on-device
+ *      processed pic (+10.8), while the stock JPEGs measure ~0. FM2 has
+ *      identical row sums (both matrices map to XYZ D50), so matrix
+ *      interpolation cannot fix it. The correct chain is FM1 -> Bradford
+ *      adaptation D50->D65 -> XYZ-to-sRGB (D65); the two constant
+ *      matrices are pre-multiplied into M_XYZ2SRGB and combined with
+ *      FM1 per file (single 3x3, exact: M @ D50-white = (1,1,1)). After
+ *      the fix the cast measures -1.1..+0.1 on all 4 pairs, in the stock
+ *      range. Negatives are clipped to 0 after the matrix.
  *   7. Exposure: automatic base gain = 0.30 / median(green photosites
  *      of the merged linear RAW), then the look's EV on top.
  *   8. Highlight rolloff (linear, above 0.75):
@@ -256,6 +263,28 @@ object RawProcessor {
     private const val TILE_ROWS = 256
 
     /**
+     * Constant XYZ-D50 -> linear-sRGB matrix: Bradford chromatic adaptation
+     * D50->D65 followed by the XYZ->sRGB (D65) matrix. ForwardMatrix1 maps
+     * to XYZ D50, so the per-file camera->sRGB matrix is M_XYZ2SRGB x FM1.
+     * Derived in the round-2 report (Bradford cone matrix + D50/D65 whites);
+     * sanity: M @ (0.9642, 1.0, 0.8251) = (1, 1, 1).
+     */
+    private val M_XYZ2SRGB = floatArrayOf(
+        3.1339686f, -1.6168703f, -0.4907131f,
+        -0.9783911f, 1.9158704f, 0.0333878f,
+        0.0720104f, -0.2289867f, 1.4053693f
+    )
+
+    /** 3x3 row-major matrix product: out = a x b. */
+    private fun matMul(a: FloatArray, b: FloatArray): FloatArray {
+        val out = FloatArray(9)
+        for (r in 0..2) for (c in 0..2) {
+            out[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c]
+        }
+        return out
+    }
+
+    /**
      * Adds one frame's normalised linear RAW into [acc] (which the caller
      * zeroed first). After all frames, call [scaleAcc] with 1/n.
      * Streaming: the caller reads one DNG at a time, so a burst never sits
@@ -278,17 +307,27 @@ object RawProcessor {
         val w = info.width
         val h = info.height
         require(merged.size == w * h) { "merged RAW size ${merged.size} != ${w}x$h" }
-        // White-balance gains: 1 / AsShotNeutral (green = 1), then the
-        // look's temp (R up, B down) and tint (G). Normalising divides by
-        // the green gain 1/asn[1], i.e. multiplies by asn[1].
+        // White-balance gains: 1 / AsShotNeutral, normalised so green = 1
+        // (same as the reference: wb = (1/asn) / (1/asn[1])), then the
+        // look's temp (R up, B down) and tint (G). Round-2 note: an
+        // earlier version multiplied the green gain by asn[1] instead of
+        // normalising it to 1.0; that was dormant here (asn green is
+        // exactly 1.0 in every DNG this device writes) but diverged from
+        // the reference, so it is corrected here.
         val wb = FloatArray(3)
         val n0 = info.asShotNeutral[0]; val n1 = info.asShotNeutral[1]; val n2 = info.asShotNeutral[2]
         val g0 = if (n0 > 0f) 1f / n0 else 1f
         val g2 = if (n2 > 0f) 1f / n2 else 1f
         val gn = if (n1 > 0f) n1 else 1f // green is 1.0 in these files
         wb[0] = g0 * gn * look.temp
-        wb[1] = gn * look.tint
+        wb[1] = look.tint
         wb[2] = g2 * gn / look.temp
+
+        // Colour matrix: ForwardMatrix1 maps to XYZ D50, so combine it
+        // with M_XYZ2SRGB (XYZ D50 -> linear sRGB) per file. Round 1
+        // used ForwardMatrix1 directly as sRGB — that was the green-cast
+        // bug (round-2 report §2).
+        val colourMatrix = matMul(M_XYZ2SRGB, info.forwardMatrix)
 
         // Automatic base exposure from the green photosites of the merged RAW.
         val greenMedian = greenMedian(merged, info)
@@ -299,7 +338,7 @@ object RawProcessor {
         while (y0 < h) {
             val tileH = min(TILE_ROWS, h - y0)
             val tile = demosaicTile(merged, info, 0, y0, w, tileH)
-            finishTile(tile, w, tileH, info.forwardMatrix, wb, look, gain, 0, y0, sink)
+            finishTile(tile, w, tileH, colourMatrix, wb, look, gain, 0, y0, sink)
             y0 += tileH
         }
         return ProcessStats(baseGain, gain, greenMedian, wb)

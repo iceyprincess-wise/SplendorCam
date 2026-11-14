@@ -1,0 +1,15 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- SplendorCam mark: white camera body + lens, amber shutter dot.
+         Same geometry as the legacy PNGs (see make_logo.py in the round-2 report). -->
+    <path android:fillColor="#FFFFFF" android:pathData="M44,29 h20 v8 h-20 z" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M35,36 h38 a9,9 0 0 1 9,9 v28 a9,9 0 0 1 -9,9 h-38 a9,9 0 0 1 -9,-9 v-28 a9,9 0 0 1 9,-9 z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M54,44 A15,15 0 1,1 53.9,44 Z" />
+    <path android:fillColor="#0F2A33" android:pathData="M54,49 A10,10 0 1,1 53.9,49 Z" />
+    <path android:fillColor="#FFB300" android:pathData="M54,53.5 A5.5,5.5 0 1,1 53.9,53.5 Z" />
+    <path android:fillColor="#FFB300" android:pathData="M75,41.5 A2.5,2.5 0 1,1 74.9,41.5 Z" />
+</vector>
